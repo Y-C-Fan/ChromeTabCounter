@@ -42,11 +42,18 @@ header h1 {
 .rank.r0 { background: linear-gradient(90deg,#ff6a00,#ee0979); color:#fff; }
 .rank.r1 { background: linear-gradient(90deg,#f7971e,#ffd200); color:#222; }
 .rank.r2 { background: linear-gradient(90deg,#11998e,#38ef7d); color:#0a3d2a; }
-.domain {
+.info { min-width: 0; }
+.title {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; font-weight: 500;
 }
-.domain a { color: var(--fg); text-decoration: none; }
-.domain a:hover { text-decoration: underline; }
+.title a { color: var(--fg); text-decoration: none; }
+.title a:hover { text-decoration: underline; }
+.sub {
+  font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-top: 1px;
+}
 .count { font-variant-numeric: tabular-nums; color: var(--muted); }
 .count b { color: var(--fg); font-size: 14px; }
 .bar {

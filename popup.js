@@ -26,12 +26,19 @@ async function refresh() {
     ranks.innerHTML = shown.map((it, i) => {
       const pct = Math.round(it.count / max * 100);
       const rankCls = i < 3 ? `rank r${i}` : 'rank';
-      const safe = escapeHtml(it.domain);
+      const safeDomain = escapeHtml(it.domain);
+      // 标题：优先用页面 title，没有就 fallback 到域名
+      const rawTitle = (it.title && it.title.trim()) ? it.title.trim() : it.domain;
+      const safeTitle = escapeHtml(rawTitle);
+      const showSubdomain = rawTitle !== it.domain;   // 标题就是域名时不重复显示
       return `
         <div class="row-item">
           <div class="${rankCls}">${i + 1}</div>
-          <div>
-            <div class="domain"><a href="https://${encodeURIComponent(it.domain)}" target="_blank" rel="noopener">${safe}</a></div>
+          <div class="info">
+            <div class="title" title="${safeTitle}">
+              <a href="https://${encodeURIComponent(it.domain)}" target="_blank" rel="noopener">${safeTitle}</a>
+            </div>
+            ${showSubdomain ? `<div class="sub">${safeDomain}</div>` : ''}
             <div class="bar"><i style="width:${pct}%"></i></div>
           </div>
           <div class="count"><b>${it.count}</b> 次</div>

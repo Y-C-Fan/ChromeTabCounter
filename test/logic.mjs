@@ -19,16 +19,13 @@ function makeChromeMock() {
     alarms_onAlarm: [],
   };
 
-  // 模拟一组 tab 状态
   const tabsById = new Map();
   let activeTabId = null;
-  let focusedWindowId = 1;
 
   return {
     listeners,
     tabsById,
     setActive(tabId) { activeTabId = tabId; },
-    setFocusedWindow(id) { focusedWindowId = id; },
     chrome: {
       storage: {
         local: {
@@ -45,11 +42,7 @@ function makeChromeMock() {
         onActivated: { addListener: (cb) => listeners.tabs_onActivated.push(cb) },
         onUpdated: { addListener: (cb) => listeners.tabs_onUpdated.push(cb) },
         onRemoved: { addListener: (cb) => listeners.tabs_onRemoved.push(cb) },
-        query: async (opts) => {
-          // 测试中只用到 active+lastFocused / active+windowId
-          const active = Array.from(tabsById.values()).filter(t => t.id === activeTabId);
-          return active;
-        },
+        query: async () => Array.from(tabsById.values()).filter(t => t.id === activeTabId),
         get: async (id) => tabsById.get(id) || null,
       },
       windows: {
@@ -77,6 +70,17 @@ function callMessage(listeners, msg) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// 模拟一次"完整加载"：tab 改成 loading，再变 complete，并触发 onUpdated
+async function loadComplete(ctx, tabId, url, title) {
+  const tab = ctx.tabsById.get(tabId);
+  tab.url = url;
+  tab.title = title;
+  tab.status = 'complete';
+  // 只发一次 status:'complete' 事件（模拟真实浏览器：重定向链中间不发 complete）
+  await ctx.listeners.tabs_onUpdated[0](tabId, { status: 'complete' }, tab);
+  await sleep(20);
+}
+
 async function run() {
   const ctx = makeChromeMock();
   const { chrome, listeners, tabsById } = ctx;
@@ -85,87 +89,83 @@ async function run() {
   vm.createContext(sandbox);
   vm.runInContext(src, sandbox, { filename: 'background.js' });
 
-  // 启动时没有任何 tab，onInstalled 跑一遍
   for (const cb of listeners.runtime_onInstalled) await cb();
 
-  // 准备三个 tab
-  tabsById.set(1, { id: 1, url: 'https://www.youtube.com/watch?v=a', title: 'YT', active: true, windowId: 1 });
-  tabsById.set(2, { id: 2, url: 'https://www.google.com/search?q=x', title: 'G',  active: false, windowId: 1 });
-  tabsById.set(3, { id: 3, url: 'https://github.com/explore',         title: 'GH', active: false, windowId: 1 });
+  tabsById.set(1, { id: 1, url: 'https://www.youtube.com/watch?v=a', title: 'YouTube - 视频 A', active: true,  windowId: 1, status: 'complete' });
+  tabsById.set(2, { id: 2, url: 'https://www.google.com/search?q=x', title: 'Google 搜索',       active: false, windowId: 1, status: 'complete' });
+  tabsById.set(3, { id: 3, url: 'https://github.com/explore',         title: 'GitHub · 探索',    active: false, windowId: 1, status: 'complete' });
   ctx.setActive(1);
 
-  // ---- 场景 1：用户首次切到 youtube（onActivated） ----
-  // 需要先把 lastFocusedDomain 重置（因为 onInstalled 里读不到 tab，已是 null）
-  await listeners.tabs_onActivated[0]({ tabId: 1 });
-  await sleep(20);
+  // 场景 1: 首次切到 youtube
+  await listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(20);
 
-  // ---- 场景 2：在 youtube 内跳到下一个 youtube 视频（同域名，不计） ----
-  tabsById.get(1).url = 'https://www.youtube.com/watch?v=b';
-  await listeners.tabs_onUpdated[0](1, { url: tabsById.get(1).url }, tabsById.get(1));
-  await sleep(20);
+  // 场景 2: 在 youtube 内用一次 status:'complete' 跳到下一个 youtube 视频（同域名）
+  await loadComplete(ctx, 1, 'https://www.youtube.com/watch?v=b', 'YouTube - 视频 B');
 
-  // ---- 场景 3：切到 google ----
+  // 场景 3: 切到 google
   tabsById.get(1).active = false; tabsById.get(2).active = true; ctx.setActive(2);
-  await listeners.tabs_onActivated[0]({ tabId: 2 });
-  await sleep(20);
+  await listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);
 
-  // ---- 场景 4：切回 youtube ----
+  // 场景 4: 切回 youtube
   tabsById.get(2).active = false; tabsById.get(1).active = true; ctx.setActive(1);
-  await listeners.tabs_onActivated[0]({ tabId: 1 });
-  await sleep(20);
+  await listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(20);
 
-  // ---- 场景 5：再切到 google → github → google → youtube ----
+  // 场景 5: 重定向链 ── 在 google 里点了一个链接，最终落地是 zhihu.com。
+  // 真实浏览器：中间的 t.zhihu.com 不会触发 status:'complete'，只有最终页会。
+  // 我们的代码用 changeInfo.status === 'complete' 兜住，所以中间不会被记一次。
   tabsById.get(1).active = false; tabsById.get(2).active = true; ctx.setActive(2);
-  await listeners.tabs_onActivated[0]({ tabId: 2 });
-  await sleep(20);
-  tabsById.get(2).active = false; tabsById.get(3).active = true; ctx.setActive(3);
-  await listeners.tabs_onActivated[0]({ tabId: 3 });
-  await sleep(20);
-  tabsById.get(3).active = false; tabsById.get(2).active = true; ctx.setActive(2);
-  await listeners.tabs_onActivated[0]({ tabId: 2 });
-  await sleep(20);
-  tabsById.get(2).active = false; tabsById.get(1).active = true; ctx.setActive(1);
-  await listeners.tabs_onActivated[0]({ tabId: 1 });
-  await sleep(20);
+  await listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);   // google +1
+  // 模拟在当前 tab 里跳转：先 loading（不发 complete），最后 complete 在 zhuanlan
+  // 我们直接发 complete 一次到最终落地
+  await loadComplete(ctx, 2, 'https://zhuanlan.zhihu.com/p/1', '知乎专栏文章');
 
-  // ---- 场景 6：Chrome 失去焦点，再回到 youtube → 同域名也算"又回来一次" ----
-  await listeners.windows_onFocusChanged[0](-1);            // WINDOW_ID_NONE
-  await sleep(20);
-  await listeners.windows_onFocusChanged[0](1);             // 回到 window 1（仍是 youtube tab）
-  await sleep(20);
+  // 场景 6: Chrome 失焦后再回到当前 tab（zhihu），同域名也算"又回来"
+  await listeners.windows_onFocusChanged[0](-1); await sleep(20);
+  await listeners.windows_onFocusChanged[0](1);  await sleep(20);
 
-  // ---- 场景 7：地址栏从 youtube 跳到 google.com ----
-  tabsById.get(1).url = 'https://www.google.com/foo';
-  await listeners.tabs_onUpdated[0](1, { url: tabsById.get(1).url }, tabsById.get(1));
-  await sleep(20);
+  // 场景 7: 切到 chrome:// 不算（lastFocusedDomain 不变）
+  tabsById.get(2).active = false;
+  tabsById.set(99, { id: 99, url: 'chrome://extensions/', title: 'Extensions', active: true, windowId: 1, status: 'complete' });
+  ctx.setActive(99);
+  await listeners.tabs_onActivated[0]({ tabId: 99 }); await sleep(20);
 
-  // ---- 场景 8：跳到 chrome:// 不算 ----
-  tabsById.get(1).url = 'chrome://extensions/';
-  await listeners.tabs_onUpdated[0](1, { url: tabsById.get(1).url }, tabsById.get(1));
-  await sleep(20);
+  // 场景 8: 从 chrome:// 切回 zhihu，因为 lastFocusedDomain 还是 zhihu，所以不计
+  tabsById.get(99).active = false; tabsById.get(2).active = true; ctx.setActive(2);
+  await listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);
+
+  // 场景 9: onActivated 时 tab 还在 loading，等 onUpdated 兜底
+  tabsById.set(4, { id: 4, url: 'https://example.org/', title: '', active: false, windowId: 1, status: 'loading' });
+  tabsById.get(2).active = false; tabsById.get(4).active = true; ctx.setActive(4);
+  await listeners.tabs_onActivated[0]({ tabId: 4 }); await sleep(20);  // 不应计数（loading）
+  // 现在 onUpdated 触发 complete
+  await loadComplete(ctx, 4, 'https://example.org/welcome', '示例网站欢迎页');  // example.org +1
 
   await sleep(60);
 
-  const top = await callMessage(listeners, { type: 'GET_TOP_TODAY', n: 10 });
+  const top = await callMessage(listeners, { type: 'GET_TOP_TODAY', n: 20 });
   console.log('Top today:', JSON.stringify(top.items, null, 2));
   console.log('Total:', top.total);
 
-  const map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  const map = Object.fromEntries(top.items.map(i => [i.domain, i]));
   // 计数推导：
-  //  场景1: yt +1                     -> yt=1
-  //  场景2: 同域名跳转, 不计           -> yt=1
-  //  场景3: 切到 google +1             -> g=1
-  //  场景4: 切回 yt +1                 -> yt=2
-  //  场景5: g +1, gh +1, g +1, yt +1   -> yt=3, g=3, gh=1
-  //  场景6: 失焦再回, 同域名 yt +1     -> yt=4
-  //  场景7: 地址栏跳到 google.com +1   -> g=4
-  //  场景8: chrome:// 不计              -> 不变
-  assert.equal(map['youtube.com'], 4, `yt should be 4, got ${map['youtube.com']}`);
-  assert.equal(map['google.com'], 4, `g should be 4, got ${map['google.com']}`);
-  assert.equal(map['github.com'], 1, `gh should be 1, got ${map['github.com']}`);
-  assert.equal(top.total, 9);
-  // 排名靠前的应该是 yt 或 g（同 4 次）
-  assert.ok(['youtube.com', 'google.com'].includes(top.items[0].domain));
+  //  S1: yt +1                  -> yt=1
+  //  S2: 同域名跳转 yt -> yt    -> yt=1（domain 没变，不计）
+  //  S3: 切到 google +1         -> g=1
+  //  S4: 切回 yt +1             -> yt=2
+  //  S5: 切到 google +1         -> g=2; 然后地址栏跳到 zhihu +1 -> zhihu=1
+  //  S6: 失焦回来同域名(zhihu) +1 -> zhihu=2
+  //  S7: 切到 chrome://, 不计    -> 不变
+  //  S8: 切回 zhihu, 但 lastFocusedDomain 还是 zhihu, 不计 -> 不变
+  //  S9: 切到 loading tab 不计；onUpdated complete +1 -> example.org=1
+  assert.equal(map['youtube.com']?.count, 2, `yt should be 2, got ${map['youtube.com']?.count}`);
+  assert.equal(map['google.com']?.count, 2,  `g should be 2, got ${map['google.com']?.count}`);
+  assert.equal(map['zhuanlan.zhihu.com']?.count, 2,   `zhihu should be 2, got ${map['zhuanlan.zhihu.com']?.count}`);
+  assert.equal(map['example.org']?.count, 1, `example.org should be 1, got ${map['example.org']?.count}`);
+  // 标题保留
+  assert.equal(map['youtube.com']?.title, 'YouTube - 视频 B', 'should keep latest title');
+  assert.equal(map['zhuanlan.zhihu.com']?.title, '知乎专栏文章', 'zhihu title should be Chinese');
+  assert.equal(map['example.org']?.title, '示例网站欢迎页', 'example.org title should be Chinese');
+  assert.equal(top.total, 7);
 
   // settings: topN
   const upd = await callMessage(listeners, { type: 'UPDATE_SETTINGS', patch: { topN: 7 } });
