@@ -1,5 +1,9 @@
 // background.js — MV3 service worker
-// 统计每天每个域名被打开的次数，按 LFU 顺序排序提供给 popup。
+// 统计每天"切换/跳转到某个域名"的次数：
+//  - 切换 tab        (chrome.tabs.onActivated)
+//  - 切换浏览器窗口   (chrome.windows.onFocusChanged)
+//  - 在当前 tab 跳转 (chrome.tabs.onUpdated 的 url 变更)
+//  - Chrome 从别的 app 切回（同域名也算一次"又回来了"）
 
 const DEFAULT_SETTINGS = {
   topN: 20,             // popup 默认展示前 N 名
@@ -37,10 +41,8 @@ async function setState(patch) {
 }
 
 // ---------- 计数核心 ----------
-async function recordVisit(url, title) {
-  const domain = extractDomain(url);
+async function recordVisit(domain, title) {
   if (!domain) return;
-
   const day = todayKey();
   const { byDay, settings } = await getState();
 
@@ -64,39 +66,69 @@ async function recordVisit(url, title) {
   await setState({ byDay });
 }
 
-// 防抖：同一 tab 在 1.2 秒内的多次 commit 算一次（避免框架重定向重复计数）
-const lastCommitByTab = new Map(); // tabId -> { url, ts }
+// ---------- 焦点跟踪 ----------
+let lastFocusedDomain = null;
+let chromeHasFocus = true;
 
-async function maybeCount(tabId, url) {
-  const now = Date.now();
-  const prev = lastCommitByTab.get(tabId);
-  if (prev && prev.url === url && now - prev.ts < 1200) return;
-  lastCommitByTab.set(tabId, { url, ts: now });
-
-  let title = '';
+async function getFocusedTab(windowId) {
   try {
-    const tab = await chrome.tabs.get(tabId);
-    title = tab?.title || '';
-  } catch { /* tab 可能已关 */ }
-  await recordVisit(url, title);
+    const opts = (windowId !== undefined && windowId !== chrome.windows.WINDOW_ID_NONE)
+      ? { active: true, windowId }
+      : { active: true, lastFocusedWindow: true };
+    const tabs = await chrome.tabs.query(opts);
+    return tabs[0] || null;
+  } catch {
+    return null;
+  }
 }
 
-// ---------- 事件监听 ----------
-chrome.webNavigation.onCommitted.addListener((details) => {
-  if (details.frameId !== 0) return;          // 只统计主框架
-  if (!details.url) return;
-  if (!/^https?:/.test(details.url)) return;
-  maybeCount(details.tabId, details.url);
+// 处理"焦点可能变化"的事件，决定是否计一次。
+async function handleFocusEvent({ fromUnfocus = false, windowId } = {}) {
+  const tab = await getFocusedTab(windowId);
+  if (!tab || !tab.url || !/^https?:/.test(tab.url)) {
+    // 当前焦点在 chrome:// / 新标签页等，不动 lastFocusedDomain，避免回到普通页时被当作"切换"
+    return;
+  }
+  const domain = extractDomain(tab.url);
+  if (!domain) return;
+
+  const isDifferent = domain !== lastFocusedDomain;
+  // 同域名 + 是从 Chrome 失焦回来 → 也算"又回来一次"
+  if (fromUnfocus || isDifferent) {
+    await recordVisit(domain, tab.title || '');
+  }
+  lastFocusedDomain = domain;
+}
+
+// 1) 切换 tab
+chrome.tabs.onActivated.addListener(() => {
+  handleFocusEvent();
 });
 
-// 也覆盖 history.pushState/replaceState 这种 SPA 跳转
-chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
-  if (details.frameId !== 0) return;
-  if (!/^https?:/.test(details.url)) return;
-  maybeCount(details.tabId, details.url);
+// 2) 切换窗口 / Chrome 失去 / 重获焦点
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    chromeHasFocus = false;
+    return;
+  }
+  const wasUnfocused = !chromeHasFocus;
+  chromeHasFocus = true;
+  await handleFocusEvent({ fromUnfocus: wasUnfocused, windowId });
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => lastCommitByTab.delete(tabId));
+// 3) 当前 tab 的 url 变了（包括地址栏跳转和 SPA history）
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url) return;
+  if (!tab || !tab.active) return;
+  if (!/^https?:/.test(changeInfo.url)) return;
+  handleFocusEvent();
+});
+
+// 4) tab 关掉 → 如果关掉的就是当前焦点 tab，把记忆清空，等下一次 onActivated
+chrome.tabs.onRemoved.addListener(() => {
+  // 简单粗暴：清掉，让下一次激活的 tab 一定算一次切换
+  lastFocusedDomain = null;
+});
 
 // ---------- 与 popup 通信 ----------
 async function getTopForDay(day, n) {
@@ -149,6 +181,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   const { settings } = await getState();
   await setState({ settings: { ...DEFAULT_SETTINGS, ...settings } });
   chrome.alarms.create('daily-cleanup', { periodInMinutes: 60 });
+  // 启动时把当前 tab 视作"刚切换过来"，先记录一次起点（不计数，只设 lastFocusedDomain）
+  const tab = await getFocusedTab();
+  if (tab && tab.url && /^https?:/.test(tab.url)) {
+    lastFocusedDomain = extractDomain(tab.url);
+  }
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
