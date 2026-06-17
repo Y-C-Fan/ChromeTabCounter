@@ -1,10 +1,8 @@
 // background.js — MV3 service worker
-// 统计每天每个域名被打开的次数，按 LFU 顺序排序提供给 popup / content。
+// 统计每天每个域名被打开的次数，按 LFU 顺序排序提供给 popup。
 
 const DEFAULT_SETTINGS = {
-  showBar: true,        // 是否在网页顶部显示浮动条
-  topN: 5,              // 浮动条展示的高频站点数
-  minCountForBar: 2,    // 至少访问过 N 次才上浮动条（避免一开始就一堆 1 次的）
+  topN: 20,             // popup 默认展示前 N 名
   retentionDays: 30,    // 历史保留天数
 };
 
@@ -64,8 +62,6 @@ async function recordVisit(url, title) {
   }
 
   await setState({ byDay });
-  // 通知所有 tab 的 content script 刷新浮动条
-  broadcastUpdate();
 }
 
 // 防抖：同一 tab 在 1.2 秒内的多次 commit 算一次（避免框架重定向重复计数）
@@ -90,11 +86,10 @@ chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId !== 0) return;          // 只统计主框架
   if (!details.url) return;
   if (!/^https?:/.test(details.url)) return;
-  // 过滤：浏览器内部导航类型如 auto_subframe 已由 frameId 排除
   maybeCount(details.tabId, details.url);
 });
 
-// 也覆盖 history.pushState/replaceState 这种 SPA 跳转（如 youtube/twitter）
+// 也覆盖 history.pushState/replaceState 这种 SPA 跳转
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId !== 0) return;
   if (!/^https?:/.test(details.url)) return;
@@ -103,7 +98,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => lastCommitByTab.delete(tabId));
 
-// ---------- 与 popup / content 通信 ----------
+// ---------- 与 popup 通信 ----------
 async function getTopForDay(day, n) {
   const { byDay, settings } = await getState();
   const dayMap = byDay[day] || {};
@@ -130,17 +125,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const { settings } = await getState();
         const merged = { ...settings, ...(msg.patch || {}) };
         await setState({ settings: merged });
-        broadcastUpdate();
         sendResponse({ ok: true, settings: merged });
       } else if (msg?.type === 'CLEAR_TODAY') {
         const { byDay } = await getState();
         delete byDay[todayKey()];
         await setState({ byDay });
-        broadcastUpdate();
         sendResponse({ ok: true });
       } else if (msg?.type === 'CLEAR_ALL') {
         await setState({ byDay: {} });
-        broadcastUpdate();
         sendResponse({ ok: true });
       } else {
         sendResponse({ ok: false, error: 'unknown_message' });
@@ -152,21 +144,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true; // 异步响应
 });
 
-async function broadcastUpdate() {
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const t of tabs) {
-      if (!t.id || !t.url || !/^https?:/.test(t.url)) continue;
-      chrome.tabs.sendMessage(t.id, { type: 'STATS_UPDATED' }).catch(() => {});
-    }
-  } catch { /* ignore */ }
-}
-
 // ---------- 初始化 ----------
 chrome.runtime.onInstalled.addListener(async () => {
   const { settings } = await getState();
   await setState({ settings: { ...DEFAULT_SETTINGS, ...settings } });
-  // 每小时跑一次清理
   chrome.alarms.create('daily-cleanup', { periodInMinutes: 60 });
 });
 

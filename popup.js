@@ -12,58 +12,49 @@ function escapeHtml(s) {
 }
 
 async function refresh() {
-  const resp = await send({ type: 'GET_TOP_TODAY', n: 50 });
+  const resp = await send({ type: 'GET_TOP_TODAY', n: 100 });
   const ranks = document.getElementById('ranks');
   document.getElementById('today-label').textContent = resp.day;
   document.getElementById('total').textContent = resp.total ?? 0;
 
   if (!resp.items || resp.items.length === 0) {
     ranks.innerHTML = `<div class="empty">暂无数据，去访问几个网页就有了。</div>`;
-    return;
-  }
-  const max = resp.items[0].count;
-  ranks.innerHTML = resp.items.map((it, i) => {
-    const pct = Math.round(it.count / max * 100);
-    const rankCls = i < 3 ? `rank r${i}` : 'rank';
-    const safe = escapeHtml(it.domain);
-    return `
-      <div class="row-item">
-        <div class="${rankCls}">${i + 1}</div>
-        <div>
-          <div class="domain"><a href="https://${encodeURIComponent(it.domain)}" target="_blank" rel="noopener">${safe}</a></div>
-          <div class="bar"><i style="width:${pct}%"></i></div>
+  } else {
+    const max = resp.items[0].count;
+    const topN = resp.settings?.topN ?? 20;
+    const shown = resp.items.slice(0, topN);
+    ranks.innerHTML = shown.map((it, i) => {
+      const pct = Math.round(it.count / max * 100);
+      const rankCls = i < 3 ? `rank r${i}` : 'rank';
+      const safe = escapeHtml(it.domain);
+      return `
+        <div class="row-item">
+          <div class="${rankCls}">${i + 1}</div>
+          <div>
+            <div class="domain"><a href="https://${encodeURIComponent(it.domain)}" target="_blank" rel="noopener">${safe}</a></div>
+            <div class="bar"><i style="width:${pct}%"></i></div>
+          </div>
+          <div class="count"><b>${it.count}</b> 次</div>
         </div>
-        <div class="count"><b>${it.count}</b> 次</div>
-      </div>
-    `;
-  }).join('');
+      `;
+    }).join('');
+  }
 
   // 反映设置
   const s = resp.settings || {};
-  document.getElementById('showBar').checked = !!s.showBar;
-  document.getElementById('topN').value = s.topN ?? 5;
-  document.getElementById('minCountForBar').value = s.minCountForBar ?? 2;
+  document.getElementById('topN').value = s.topN ?? 20;
 }
 
 function bindSettings() {
-  const showBar = document.getElementById('showBar');
   const topN = document.getElementById('topN');
-  const minCount = document.getElementById('minCountForBar');
 
-  const update = async () => {
+  topN.addEventListener('change', async () => {
     await send({
       type: 'UPDATE_SETTINGS',
-      patch: {
-        showBar: showBar.checked,
-        topN: Math.max(1, Math.min(20, Number(topN.value) || 5)),
-        minCountForBar: Math.max(1, Math.min(50, Number(minCount.value) || 2)),
-      },
+      patch: { topN: Math.max(1, Math.min(100, Number(topN.value) || 20)) },
     });
     refresh();
-  };
-  showBar.addEventListener('change', update);
-  topN.addEventListener('change', update);
-  minCount.addEventListener('change', update);
+  });
 
   document.getElementById('clear-today').addEventListener('click', async () => {
     if (!confirm('清空今日的统计？')) return;
