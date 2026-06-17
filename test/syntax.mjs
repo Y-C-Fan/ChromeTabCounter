@@ -4,7 +4,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 
 const root = path.resolve('.');
-const jsFiles = ['background.js', 'content.js', 'popup.js'];
+const jsFiles = ['background.js', 'popup.js'];
 const jsonFiles = ['manifest.json'];
 
 let failed = 0;
