@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Tab Frequency</title>
+<link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>📊 今日访问统计</h1>
+    <div class="meta">
+      <span id="today-label"></span>
+      <span class="dot">·</span>
+      <span>共 <b id="total">0</b> 次访问</span>
+    </div>
+  </header>
+
+  <section class="ranks" id="ranks">
+    <div class="empty">暂无数据，去访问几个网页就有了。</div>
+  </section>
+
+  <section class="settings">
+    <h2>设置</h2>
+    <label class="row">
+      <span>在网页顶部显示浮动条</span>
+      <input type="checkbox" id="showBar" />
+    </label>
+    <label class="row">
+      <span>浮动条显示前 N 个</span>
+      <input type="number" id="topN" min="1" max="20" />
+    </label>
+    <label class="row">
+      <span>至少访问几次才上榜</span>
+      <input type="number" id="minCountForBar" min="1" max="50" />
+    </label>
+    <div class="row buttons">
+      <button id="clear-today" class="danger-outline">清空今日</button>
+      <button id="clear-all" class="danger">清空全部</button>
+    </div>
+  </section>
+
+  <footer>v0.1.0 · LFU 高频上浮</footer>
+  <script src="popup.js"></script>
+</body>
+</html>
