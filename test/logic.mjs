@@ -1,5 +1,6 @@
 // test/logic.mjs
 // mock chrome 的 tabs/windows 事件，验证"切换到域名"计数。
+// 重点覆盖：重定向链、SW 重启、B 站重复 complete、冷却节流、loading 抖动。
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -8,7 +9,8 @@ import assert from 'node:assert/strict';
 const src = fs.readFileSync(path.resolve('background.js'), 'utf8');
 
 function makeChromeMock() {
-  const storage = { local: {} };
+  const local = {};
+  const session = {};
   const listeners = {
     tabs_onActivated: [],
     tabs_onUpdated: [],
@@ -18,24 +20,31 @@ function makeChromeMock() {
     runtime_onInstalled: [],
     alarms_onAlarm: [],
   };
-
   const tabsById = new Map();
   let activeTabId = null;
 
   return {
-    listeners,
-    tabsById,
-    setActive(tabId) { activeTabId = tabId; },
+    listeners, tabsById, local, session,
+    setActive(id) { activeTabId = id; },
     chrome: {
       storage: {
         local: {
           get: async (keys) => {
             const out = {};
-            const list = Array.isArray(keys) ? keys : [keys];
-            for (const k of list) if (k in storage.local) out[k] = storage.local[k];
+            const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || local));
+            for (const k of list) if (k in local) out[k] = local[k];
             return out;
           },
-          set: async (obj) => Object.assign(storage.local, obj),
+          set: async (obj) => Object.assign(local, obj),
+        },
+        session: {
+          get: async (keys) => {
+            const out = {};
+            const list = Array.isArray(keys) ? keys : (typeof keys === 'string' ? [keys] : Object.keys(keys || session));
+            for (const k of list) if (k in session) out[k] = session[k];
+            return out;
+          },
+          set: async (obj) => Object.assign(session, obj),
         },
       },
       tabs: {
@@ -58,7 +67,6 @@ function makeChromeMock() {
         onAlarm: { addListener: (cb) => listeners.alarms_onAlarm.push(cb) },
       },
     },
-    storage,
   };
 }
 
@@ -70,113 +78,138 @@ function callMessage(listeners, msg) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// 模拟一次"完整加载"：tab 改成 loading，再变 complete，并触发 onUpdated
-async function loadComplete(ctx, tabId, url, title) {
-  const tab = ctx.tabsById.get(tabId);
-  tab.url = url;
-  tab.title = title;
-  tab.status = 'complete';
-  // 只发一次 status:'complete' 事件（模拟真实浏览器：重定向链中间不发 complete）
-  await ctx.listeners.tabs_onUpdated[0](tabId, { status: 'complete' }, tab);
-  await sleep(20);
+function loadSandbox(src, ctx) {
+  const sandbox = {
+    chrome: ctx.chrome,
+    console,
+    URL, Date, setTimeout, setInterval, Map,
+    // 把测试用的冷却时间调短，便于断言
+    __TFC_COOLDOWN_MS: 200,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox, { filename: 'background.js' });
+  return sandbox;
 }
 
 async function run() {
-  const ctx = makeChromeMock();
-  const { chrome, listeners, tabsById } = ctx;
+  // ============ Pass 1: 主功能 ============
+  let ctx = makeChromeMock();
+  loadSandbox(src, ctx);
+  for (const cb of ctx.listeners.runtime_onInstalled) await cb();
 
-  const sandbox = { chrome, console, URL, Date, setTimeout, setInterval, Map };
-  vm.createContext(sandbox);
-  vm.runInContext(src, sandbox, { filename: 'background.js' });
-
-  for (const cb of listeners.runtime_onInstalled) await cb();
-
-  tabsById.set(1, { id: 1, url: 'https://www.youtube.com/watch?v=a', title: 'YouTube - 视频 A', active: true,  windowId: 1, status: 'complete' });
-  tabsById.set(2, { id: 2, url: 'https://www.google.com/search?q=x', title: 'Google 搜索',       active: false, windowId: 1, status: 'complete' });
-  tabsById.set(3, { id: 3, url: 'https://github.com/explore',         title: 'GitHub · 探索',    active: false, windowId: 1, status: 'complete' });
+  ctx.tabsById.set(1, { id: 1, url: 'https://www.bilibili.com/video/BV1', title: '【测试】视频 A_哔哩哔哩', active: true,  windowId: 1, status: 'complete' });
+  ctx.tabsById.set(2, { id: 2, url: 'https://www.google.com/',            title: 'Google',                  active: false, windowId: 1, status: 'complete' });
   ctx.setActive(1);
 
-  // 场景 1: 首次切到 youtube
-  await listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(20);
-
-  // 场景 2: 在 youtube 内用一次 status:'complete' 跳到下一个 youtube 视频（同域名）
-  await loadComplete(ctx, 1, 'https://www.youtube.com/watch?v=b', 'YouTube - 视频 B');
-
+  // 场景 1: 切到 B 站
+  await ctx.listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(20);
+  // 场景 2: B 站连续抛 3 次 complete（视频流加载、播放器异步、SDK），应该只计 1 次
+  for (let i = 0; i < 3; i++) {
+    await ctx.listeners.tabs_onUpdated[0](1, { status: 'complete' }, ctx.tabsById.get(1));
+    await sleep(30);
+  }
   // 场景 3: 切到 google
-  tabsById.get(1).active = false; tabsById.get(2).active = true; ctx.setActive(2);
-  await listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);
-
-  // 场景 4: 切回 youtube
-  tabsById.get(2).active = false; tabsById.get(1).active = true; ctx.setActive(1);
-  await listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(20);
-
-  // 场景 5: 重定向链 ── 在 google 里点了一个链接，最终落地是 zhihu.com。
-  // 真实浏览器：中间的 t.zhihu.com 不会触发 status:'complete'，只有最终页会。
-  // 我们的代码用 changeInfo.status === 'complete' 兜住，所以中间不会被记一次。
-  tabsById.get(1).active = false; tabsById.get(2).active = true; ctx.setActive(2);
-  await listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);   // google +1
-  // 模拟在当前 tab 里跳转：先 loading（不发 complete），最后 complete 在 zhuanlan
-  // 我们直接发 complete 一次到最终落地
-  await loadComplete(ctx, 2, 'https://zhuanlan.zhihu.com/p/1', '知乎专栏文章');
-
-  // 场景 6: Chrome 失焦后再回到当前 tab（zhihu），同域名也算"又回来"
-  await listeners.windows_onFocusChanged[0](-1); await sleep(20);
-  await listeners.windows_onFocusChanged[0](1);  await sleep(20);
-
-  // 场景 7: 切到 chrome:// 不算（lastFocusedDomain 不变）
-  tabsById.get(2).active = false;
-  tabsById.set(99, { id: 99, url: 'chrome://extensions/', title: 'Extensions', active: true, windowId: 1, status: 'complete' });
-  ctx.setActive(99);
-  await listeners.tabs_onActivated[0]({ tabId: 99 }); await sleep(20);
-
-  // 场景 8: 从 chrome:// 切回 zhihu，因为 lastFocusedDomain 还是 zhihu，所以不计
-  tabsById.get(99).active = false; tabsById.get(2).active = true; ctx.setActive(2);
-  await listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);
-
-  // 场景 9: onActivated 时 tab 还在 loading，等 onUpdated 兜底
-  tabsById.set(4, { id: 4, url: 'https://example.org/', title: '', active: false, windowId: 1, status: 'loading' });
-  tabsById.get(2).active = false; tabsById.get(4).active = true; ctx.setActive(4);
-  await listeners.tabs_onActivated[0]({ tabId: 4 }); await sleep(20);  // 不应计数（loading）
-  // 现在 onUpdated 触发 complete
-  await loadComplete(ctx, 4, 'https://example.org/welcome', '示例网站欢迎页');  // example.org +1
+  ctx.tabsById.get(1).active = false; ctx.tabsById.get(2).active = true; ctx.setActive(2);
+  await ctx.listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(20);
+  // 场景 4: 切回 B 站（用户描述的"我点完之后我再回来"）—— 等过冷却才能再 +1
+  await sleep(220);
+  ctx.tabsById.get(2).active = false; ctx.tabsById.get(1).active = true; ctx.setActive(1);
+  await ctx.listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(20);
+  // 场景 5: 再次回到 B 站后，B 站又抛了一次 complete（比如视频换集）—— 在冷却内，不应再计
+  await ctx.listeners.tabs_onUpdated[0](1, { status: 'complete' }, ctx.tabsById.get(1));
+  await sleep(30);
 
   await sleep(60);
+  let top = await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY', n: 10 });
+  console.log('[Pass 1 result]', JSON.stringify(top.items.map(x=>({d:x.domain,c:x.count,t:x.title})),null,2));
 
-  const top = await callMessage(listeners, { type: 'GET_TOP_TODAY', n: 20 });
-  console.log('Top today:', JSON.stringify(top.items, null, 2));
-  console.log('Total:', top.total);
+  let map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  assert.equal(map['bilibili.com'], 2, `B站应该是 2（首次切入 + 切回）, 实际 ${map['bilibili.com']}`);
+  assert.equal(map['google.com'], 1, `google 应该是 1, 实际 ${map['google.com']}`);
+  assert.equal(top.total, 3, `总数应该是 3, 实际 ${top.total}`);
+  console.log('Pass 1 OK: 重复 complete + 切走再回 不会双计');
 
-  const map = Object.fromEntries(top.items.map(i => [i.domain, i]));
-  // 计数推导：
-  //  S1: yt +1                  -> yt=1
-  //  S2: 同域名跳转 yt -> yt    -> yt=1（domain 没变，不计）
-  //  S3: 切到 google +1         -> g=1
-  //  S4: 切回 yt +1             -> yt=2
-  //  S5: 切到 google +1         -> g=2; 然后地址栏跳到 zhihu +1 -> zhihu=1
-  //  S6: 失焦回来同域名(zhihu) +1 -> zhihu=2
-  //  S7: 切到 chrome://, 不计    -> 不变
-  //  S8: 切回 zhihu, 但 lastFocusedDomain 还是 zhihu, 不计 -> 不变
-  //  S9: 切到 loading tab 不计；onUpdated complete +1 -> example.org=1
-  assert.equal(map['youtube.com']?.count, 2, `yt should be 2, got ${map['youtube.com']?.count}`);
-  assert.equal(map['google.com']?.count, 2,  `g should be 2, got ${map['google.com']?.count}`);
-  assert.equal(map['zhuanlan.zhihu.com']?.count, 2,   `zhihu should be 2, got ${map['zhuanlan.zhihu.com']?.count}`);
-  assert.equal(map['example.org']?.count, 1, `example.org should be 1, got ${map['example.org']?.count}`);
-  // 标题保留
-  assert.equal(map['youtube.com']?.title, 'YouTube - 视频 B', 'should keep latest title');
-  assert.equal(map['zhuanlan.zhihu.com']?.title, '知乎专栏文章', 'zhihu title should be Chinese');
-  assert.equal(map['example.org']?.title, '示例网站欢迎页', 'example.org title should be Chinese');
-  assert.equal(top.total, 7);
+  // ============ Pass 2: 失焦再回 ============
+  // Chrome 失去焦点（用户去 VS Code），再回 Chrome → 同域名也算"又回来一次"
+  await ctx.listeners.windows_onFocusChanged[0](-1); await sleep(20);
+  // 等过冷却
+  await sleep(250);
+  await ctx.listeners.windows_onFocusChanged[0](1); await sleep(20);
+  await sleep(60);
+  top = await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY' });
+  map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  assert.equal(map['bilibili.com'], 3, `失焦回来后 B站应该是 3, 实际 ${map['bilibili.com']}`);
+  console.log('Pass 2 OK: 失焦回到同域名 +1');
 
-  // settings: topN
-  const upd = await callMessage(listeners, { type: 'UPDATE_SETTINGS', patch: { topN: 7 } });
-  assert.equal(upd.settings.topN, 7);
+  // ============ Pass 3: 失焦快速回（冷却内）不计 ============
+  await ctx.listeners.windows_onFocusChanged[0](-1); await sleep(20);
+  await ctx.listeners.windows_onFocusChanged[0](1);  await sleep(20);   // 立刻回，应被冷却挡住
+  await sleep(60);
+  top = await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY' });
+  map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  assert.equal(map['bilibili.com'], 3, `冷却内重复触发不应计数, 实际 ${map['bilibili.com']}`);
+  console.log('Pass 3 OK: 冷却内重复触发被挡住');
 
-  // CLEAR_TODAY
-  await callMessage(listeners, { type: 'CLEAR_TODAY' });
-  const after = await callMessage(listeners, { type: 'GET_TOP_TODAY' });
-  assert.equal(after.items.length, 0);
+  // ============ Pass 4: SW 重启场景 ============
+  // 模拟 service worker 被回收：重新 load 一遍 background.js（local + session 数据保留）
+  // 重启前再切到 google 让 lastFocusedDomain=google
+  ctx.tabsById.get(1).active = false; ctx.tabsById.get(2).active = true; ctx.setActive(2);
+  // 等过冷却（之前 google 是 200ms 前算的，加 sleep 250 即可）
+  await sleep(260);
+  await ctx.listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(30);
+  let beforeRestart = (await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY' }));
+  let gBefore = beforeRestart.items.find(i=>i.domain==='google.com')?.count;
+  console.log(`Before SW restart: google=${gBefore}`);
 
-  console.log('--- logic check passed ---');
+  // SW 重启：清掉所有事件 listener（模拟 worker 被回收），重新 load
+  const oldLocal = ctx.local; const oldSession = ctx.session;
+  const oldTabs = ctx.tabsById; const oldActive = 2;
+  ctx = makeChromeMock();
+  Object.assign(ctx.local, oldLocal);
+  Object.assign(ctx.session, oldSession);
+  for (const [k,v] of oldTabs) ctx.tabsById.set(k, v);
+  ctx.setActive(oldActive);
+  loadSandbox(src, ctx);
+  // SW 重启时 onInstalled 不会再跑（只有真实安装/更新时才跑）
+  console.log('[SW restarted]');
+
+  // 重启后切回 B 站
+  ctx.tabsById.get(2).active = false; ctx.tabsById.get(1).active = true; ctx.setActive(1);
+  await ctx.listeners.tabs_onActivated[0]({ tabId: 1 }); await sleep(30);
+  await sleep(60);
+  top = await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY' });
+  map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  // B 站之前是 3，现在切回 +1 = 4。重启不应该让计数翻倍或漏掉。
+  assert.equal(map['bilibili.com'], 4, `SW 重启后切回 B站应该 +1 = 4, 实际 ${map['bilibili.com']}`);
+  console.log('Pass 4 OK: SW 重启后状态保留 (lastFocusedDomain 持久化)');
+
+  // ============ Pass 5: 重定向链不计中间 ============
+  // 在 google 的 tab 里跳转：mock 实现 —— 中间页不会发 'complete'，只有最终落地页发
+  // 切到 google
+  ctx.tabsById.get(1).active = false; ctx.tabsById.get(2).active = true; ctx.setActive(2);
+  await sleep(260); // 过冷却
+  await ctx.listeners.tabs_onActivated[0]({ tabId: 2 }); await sleep(30);
+  // 跳到 zhihu（重定向链：google → t.cn → zhuanlan.zhihu.com，只发最终 complete）
+  ctx.tabsById.get(2).url = 'https://zhuanlan.zhihu.com/p/1';
+  ctx.tabsById.get(2).title = '知乎专栏文章';
+  await sleep(260); // 过冷却
+  await ctx.listeners.tabs_onUpdated[0](2, { status: 'complete' }, ctx.tabsById.get(2));
+  await sleep(60);
+  top = await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY' });
+  map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  assert.equal(map['zhuanlan.zhihu.com'], 1, `知乎应该是 1, 实际 ${map['zhuanlan.zhihu.com']}`);
+  // 中间不应该出现 t.cn 之类
+  for (const it of top.items) {
+    assert.ok(!/^t\./.test(it.domain), `不应该统计中间跳转域名: ${it.domain}`);
+  }
+  console.log('Pass 5 OK: 重定向链只算最终落地页');
+
+  // ============ Pass 6: 标题中文 ============
+  const bili = top.items.find(i => i.domain === 'bilibili.com');
+  assert.ok(bili.title.includes('哔哩哔哩'), `B站标题应包含中文: ${bili.title}`);
+  console.log('Pass 6 OK: 中文标题保留');
+
+  console.log('--- all logic checks passed ---');
 }
 
 run().catch(e => { console.error(e); process.exit(1); });

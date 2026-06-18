@@ -1,14 +1,27 @@
 // background.js — MV3 service worker
-// 统计每天"切换/跳转到某个域名"的次数：
-//  - 切换 tab        (chrome.tabs.onActivated，仅在 tab 已加载完时计数)
-//  - 切换浏览器窗口   (chrome.windows.onFocusChanged)
-//  - 在当前 tab 跳转 (chrome.tabs.onUpdated 的 status='complete' —— 等重定向链走完)
-//  - Chrome 从别的 app 切回（同域名也算一次"又回来了"）
+//
+// 计数语义：每次"切换/跳转到一个不同域名"或"从失焦回来到同一个域名"算一次。
+// 反双计数措施：
+//   - status === 'complete' 才计（重定向链中间不计）
+//   - 同一域名 COOLDOWN_MS 冷却内只计一次（防 SPA / 重复 complete / 抖动）
+//   - lastFocusedDomain / chromeHasFocus / lastCountAt 持久化到 storage.session
+//     这样即使 service worker 被回收重启，状态也不会丢
+//   - onActivated 时 tab 还在 loading 就不计，等 onUpdated complete 兜底
+//
+// 调试：在 chrome://extensions → 本扩展 → "检查视图: service worker"
+//      控制台能看到 [TFC] 前缀的日志（count / skip 原因 / 域名）
 
 const DEFAULT_SETTINGS = {
-  topN: 20,             // popup 默认展示前 N 名
-  retentionDays: 30,    // 历史保留天数
+  topN: 20,
+  retentionDays: 30,
 };
+
+const SESSION_KEY = 'tfc_session_state';
+const DEFAULT_SESSION = { lastFocusedDomain: null, chromeHasFocus: true, lastCountAt: {} };
+// 同 domain 多次 +1 的最小间隔。可被测试通过 globalThis.__TFC_COOLDOWN_MS 覆盖。
+const COOLDOWN_MS = (Number(globalThis.__TFC_COOLDOWN_MS) > 0)
+  ? Number(globalThis.__TFC_COOLDOWN_MS)
+  : 1500;
 
 // ---------- 工具函数 ----------
 function todayKey(d = new Date()) {
@@ -28,6 +41,17 @@ function extractDomain(url) {
   }
 }
 
+function pruneLastCountAt(map) {
+  // 只保留最近 5 分钟的，防止无限增长
+  const cutoff = Date.now() - 5 * 60 * 1000;
+  const out = {};
+  for (const [k, v] of Object.entries(map || {})) {
+    if (v >= cutoff) out[k] = v;
+  }
+  return out;
+}
+
+// ---------- 持久化数据 ----------
 async function getState() {
   const { byDay = {}, settings = {} } = await chrome.storage.local.get(['byDay', 'settings']);
   return {
@@ -38,6 +62,20 @@ async function getState() {
 
 async function setState(patch) {
   await chrome.storage.local.set(patch);
+}
+
+async function loadSession() {
+  if (chrome.storage.session) {
+    const r = await chrome.storage.session.get(SESSION_KEY);
+    return { ...DEFAULT_SESSION, ...(r[SESSION_KEY] || {}) };
+  }
+  return { ...DEFAULT_SESSION };
+}
+
+async function saveSession(sess) {
+  if (chrome.storage.session) {
+    await chrome.storage.session.set({ [SESSION_KEY]: sess });
+  }
 }
 
 // ---------- 计数核心 ----------
@@ -54,10 +92,8 @@ async function recordVisit(domain, title) {
   }
   dayMap[domain].count += 1;
   dayMap[domain].lastVisit = Date.now();
-  // 标题持续刷新（页面加载完后 tab.title 才是最终标题）
   if (title) dayMap[domain].title = title;
 
-  // 清理超期数据
   const cutoffMs = Date.now() - settings.retentionDays * 86400 * 1000;
   for (const k of Object.keys(byDay)) {
     const ts = Date.parse(k);
@@ -68,9 +104,6 @@ async function recordVisit(domain, title) {
 }
 
 // ---------- 焦点跟踪 ----------
-let lastFocusedDomain = null;
-let chromeHasFocus = true;
-
 async function getFocusedTab(windowId) {
   try {
     const opts = (windowId !== undefined && windowId !== chrome.windows.WINDOW_ID_NONE)
@@ -83,58 +116,80 @@ async function getFocusedTab(windowId) {
   }
 }
 
-// 处理"焦点可能变化"的事件，决定是否计一次。
-async function handleFocusEvent({ fromUnfocus = false, windowId } = {}) {
+// 处理"焦点可能变化"的事件，决定是否计一次。reason 仅供日志使用。
+async function handleFocusEvent({ fromUnfocus = false, windowId, reason = '' } = {}) {
   const tab = await getFocusedTab(windowId);
   if (!tab || !tab.url || !/^https?:/.test(tab.url)) {
-    // 当前焦点在 chrome:// / 新标签页等，不动 lastFocusedDomain
     return;
   }
   const domain = extractDomain(tab.url);
   if (!domain) return;
 
-  const isDifferent = domain !== lastFocusedDomain;
-  // 同域名 + 是从 Chrome 失焦回来 → 也算"又回来一次"
+  const sess = await loadSession();
+  const isDifferent = domain !== sess.lastFocusedDomain;
+
   if (fromUnfocus || isDifferent) {
-    await recordVisit(domain, tab.title || '');
+    const last = sess.lastCountAt?.[domain] || 0;
+    const now = Date.now();
+    const since = now - last;
+    if (since < COOLDOWN_MS) {
+      console.log(`[TFC] skip(${reason}) ${domain} (cooldown ${since}ms < ${COOLDOWN_MS}ms)`);
+    } else {
+      console.log(`[TFC] count(${reason}) ${domain} title="${(tab.title||'').slice(0,60)}"`);
+      await recordVisit(domain, tab.title || '');
+      sess.lastCountAt = pruneLastCountAt(sess.lastCountAt);
+      sess.lastCountAt[domain] = now;
+    }
+  } else {
+    // 同域名，且不是失焦回来 —— 不应计数（在同域名内点链接跳转的情况）
+    // 只在 lastFocusedDomain 还没设置过时记录一下（debug）
+    // 不打印日志，避免 SPA 频繁刷屏
   }
-  lastFocusedDomain = domain;
+  sess.lastFocusedDomain = domain;
+  await saveSession(sess);
 }
 
-// 1) 切换 tab —— 只有当目标 tab 已经加载完，才立即计数；
-//    否则等它的 status: 'complete' 再算（避免新开 tab 时同时被 onActivated 和 onUpdated 各记一次）
+// 1) 切换 tab —— 只有当目标 tab 已经加载完才立即计数；否则等 onUpdated complete 兜底
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   try {
     const tab = await chrome.tabs.get(tabId);
     if (!tab) return;
-    if (tab.status === 'loading') return;   // 加载完了 onUpdated 会兜底
-    handleFocusEvent();
+    if (tab.status === 'loading') {
+      console.log(`[TFC] defer(tab-switch) tab still loading, will count on complete`);
+      return;
+    }
+    await handleFocusEvent({ reason: 'tab-switch' });
   } catch { /* tab 可能已关闭 */ }
 });
 
 // 2) 切换窗口 / Chrome 失去 / 重获焦点
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  const sess = await loadSession();
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    chromeHasFocus = false;
+    sess.chromeHasFocus = false;
+    await saveSession(sess);
+    console.log('[TFC] chrome lost focus');
     return;
   }
-  const wasUnfocused = !chromeHasFocus;
-  chromeHasFocus = true;
-  await handleFocusEvent({ fromUnfocus: wasUnfocused, windowId });
+  const wasUnfocused = !sess.chromeHasFocus;
+  sess.chromeHasFocus = true;
+  await saveSession(sess);
+  await handleFocusEvent({ fromUnfocus: wasUnfocused, windowId, reason: wasUnfocused ? 'window-refocus' : 'window-switch' });
 });
 
-// 3) 当前 tab 加载完成 —— 只在 status: 'complete' 时计数。
-//    这样能合并重定向链 (A→mid→B)：中间域名不会被记一次，只有最终落地的 B 算 1 次。
+// 3) 当前 tab 加载完成 —— 只在 status: 'complete' 时计数
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
   if (!tab || !tab.active) return;
   if (!tab.url || !/^https?:/.test(tab.url)) return;
-  handleFocusEvent();
+  handleFocusEvent({ reason: 'page-loaded' });
 });
 
-// 4) tab 关掉 → 清掉记忆，让下一次激活的 tab 一定算一次切换
-chrome.tabs.onRemoved.addListener(() => {
-  lastFocusedDomain = null;
+// 4) tab 关掉 → 让下一次激活的 tab 一定算一次切换
+chrome.tabs.onRemoved.addListener(async () => {
+  const sess = await loadSession();
+  sess.lastFocusedDomain = null;
+  await saveSession(sess);
 });
 
 // ---------- 与 popup 通信 ----------
@@ -180,7 +235,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: false, error: String(e) });
     }
   })();
-  return true; // 异步响应
+  return true;
 });
 
 // ---------- 初始化 ----------
@@ -190,7 +245,9 @@ chrome.runtime.onInstalled.addListener(async () => {
   chrome.alarms.create('daily-cleanup', { periodInMinutes: 60 });
   const tab = await getFocusedTab();
   if (tab && tab.url && /^https?:/.test(tab.url)) {
-    lastFocusedDomain = extractDomain(tab.url);
+    const sess = await loadSession();
+    sess.lastFocusedDomain = extractDomain(tab.url);
+    await saveSession(sess);
   }
 });
 
