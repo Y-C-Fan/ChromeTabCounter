@@ -209,6 +209,37 @@ async function run() {
   assert.ok(bili.title.includes('哔哩哔哩'), `B站标题应包含中文: ${bili.title}`);
   console.log('Pass 6 OK: 中文标题保留');
 
+  // ============ Pass 7: km.sankuai.com/collabpage/<id> 按 ID 分别计数 ============
+  // 三个不同协作页 + 一个非协作页路径，应该出现 3 个 collabpage key + 1 个 km.sankuai.com 域名 key
+  ctx.tabsById.set(10, { id: 10, url: 'https://km.sankuai.com/collabpage/2770130363',  title: '协作文档 A', active: false, windowId: 1, status: 'complete' });
+  ctx.tabsById.set(11, { id: 11, url: 'https://km.sankuai.com/collabpage/2770130364',  title: '协作文档 B', active: false, windowId: 1, status: 'complete' });
+  ctx.tabsById.set(12, { id: 12, url: 'https://km.sankuai.com/collabpage/2770130363?from=share', title: '协作文档 A 带参', active: false, windowId: 1, status: 'complete' });
+  ctx.tabsById.set(13, { id: 13, url: 'https://km.sankuai.com/space/123',              title: '其它页面',  active: false, windowId: 1, status: 'complete' });
+
+  async function activate(id) {
+    for (const t of ctx.tabsById.values()) t.active = (t.id === id);
+    ctx.setActive(id);
+    await sleep(260); // 过冷却
+    await ctx.listeners.tabs_onActivated[0]({ tabId: id });
+    await sleep(30);
+  }
+  await activate(10);   // collabpage/2770130363  +1
+  await activate(11);   // collabpage/2770130364  +1
+  await activate(12);   // collabpage/2770130363（带 query，应当合并到同一个 key）+1
+  await activate(13);   // km.sankuai.com         +1
+  await activate(10);   // collabpage/2770130363  +1（再回去）
+
+  await sleep(60);
+  top = await callMessage(ctx.listeners, { type: 'GET_TOP_TODAY', n: 100 });
+  map = Object.fromEntries(top.items.map(i => [i.domain, i.count]));
+  assert.equal(map['km.sankuai.com/collabpage/2770130363'], 3,
+    `2770130363 应该计 3 次（含一次带 query、一次回切）, 实际 ${map['km.sankuai.com/collabpage/2770130363']}`);
+  assert.equal(map['km.sankuai.com/collabpage/2770130364'], 1,
+    `2770130364 应该计 1 次, 实际 ${map['km.sankuai.com/collabpage/2770130364']}`);
+  assert.equal(map['km.sankuai.com'], 1,
+    `非 collabpage 路径应按域名聚合, 实际 ${map['km.sankuai.com']}`);
+  console.log('Pass 7 OK: km.sankuai.com/collabpage/<id> 按 ID 分别计数');
+
   console.log('--- all logic checks passed ---');
 }
 

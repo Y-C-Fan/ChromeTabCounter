@@ -31,12 +31,17 @@ async function refresh() {
       const rawTitle = (it.title && it.title.trim()) ? it.title.trim() : it.domain;
       const safeTitle = escapeHtml(rawTitle);
       const showSubdomain = rawTitle !== it.domain;   // 标题就是域名时不重复显示
+      // it.domain 现在可能是带路径的 key（如 km.sankuai.com/collabpage/123），
+      // 不能整体 encodeURIComponent（会把 / 编码掉），但要避免 javascript: 之类注入。
+      const safeHref = /^[\w.-]+(?:\/[\w./-]*)?$/.test(it.domain)
+        ? `https://${it.domain}`
+        : '#';
       return `
         <div class="row-item">
           <div class="${rankCls}">${i + 1}</div>
           <div class="info">
             <div class="title" title="${safeTitle}">
-              <a href="https://${encodeURIComponent(it.domain)}" target="_blank" rel="noopener">${safeTitle}</a>
+              <a href="${safeHref}" target="_blank" rel="noopener">${safeTitle}</a>
             </div>
             ${showSubdomain ? `<div class="sub">${safeDomain}</div>` : ''}
             <div class="bar"><i style="width:${pct}%"></i></div>

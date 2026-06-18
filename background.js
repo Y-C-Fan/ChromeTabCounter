@@ -31,11 +31,20 @@ function todayKey(d = new Date()) {
   return `${y}-${m}-${day}`;
 }
 
+// 返回统计 key。默认是域名（去掉 www.），但对若干特殊路径要求精确到资源 ID，
+// 让不同 ID 的页面分开计数。新增规则在这里加分支即可。
 function extractDomain(url) {
   try {
     const u = new URL(url);
     if (!/^https?:$/.test(u.protocol)) return null;
-    return u.hostname.replace(/^www\./, '');
+    const host = u.hostname.replace(/^www\./, '');
+    // km.sankuai.com/collabpage/<数字ID> —— 不同协作页要分别计数，
+    // 仅匹配末尾是数字 ID 的 collabpage 路径，其它路径仍按域名聚合。
+    if (host === 'km.sankuai.com') {
+      const m = u.pathname.match(/^\/collabpage\/(\d+)(?:[/?#]|$)/);
+      if (m) return `km.sankuai.com/collabpage/${m[1]}`;
+    }
+    return host;
   } catch {
     return null;
   }
